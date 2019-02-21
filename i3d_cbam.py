@@ -348,7 +348,7 @@ class InceptionI3d_att(nn.Module):
             x = x.mean(2).mean(2).mean(2)
             logits = self.logits(self.dropout())
         logits = logits.squeeze(3).squeeze(3).mean(2)
-        return logits, x, att_map.squeeze()
+        return logits, x, att_map
         
 
 if __name__ == '__main__':
@@ -358,4 +358,4 @@ if __name__ == '__main__':
         inp = torch.randn(2,3,24,240,320)
         logits, x, att_map = I3D(inp)
         print(logits.size(), x.size(), att_map.size())
-        # (2,106,2,4), (2,1024), (2,3,8,10)
+        # (2,106,2,4), (2,1024), (2,1,3,8,10)
