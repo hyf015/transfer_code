@@ -310,10 +310,10 @@ def selective_search(
             S[(t, n)] = _calc_sim(R[t], R[n], imsize)
 
     regions = []
+    gp[0] = gp[0] * img.shape[1]
+    gp[1] = gp[1] * img.shape[0]
     for k, r in list(R.items()):
         # x is width
-        gp[0] = gp[0] * img.shape[1]
-        gp[1] = gp[1] * img.shape[0]
         width = r['max_x'] - r['min_x']
         height = r['max_y'] - r['min_y']
         if (gp[0]>r['min_x']-0.25*width) and \
