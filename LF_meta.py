@@ -3,7 +3,6 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
 from scipy import ndimage
-from skimage import io
 import math
 from tqdm import tqdm
 import os
@@ -81,10 +80,8 @@ class LF():
         listTestFeats.sort()
         # assert(len(listTrainFeats) == len(listTrainFiles) and len(listGtFiles) > 0)
         # assert(len(listValGtFiles) == len(listValFiles))
-        self.train_loader = DataLoader(dataset=lateDataset(imgPath_s, gtPath, featPath, listTrainFiles, listGtFiles, listTrainFeats, \
+        self.loader = DataLoader(dataset=lateDataset(imgPath_s, gtPath, featPath, listFiles, listGtFiles, listFeats, \
             listValFiles, listValFeats), batch_size = batch_size, shuffle=True, num_workers=0, pin_memory=True)
-        self.val_loader = DataLoader(dataset=lateDataset(imgPath_s, gtPath, featPath, listValFiles, listValGtFiles, listValFeats), \
-            batch_size = batch_size, shuffle=False, num_workers=0, pin_memory=True)
         if loss_function == 'f':
             self.criterion = floss().to(self.device)
         else:
@@ -120,6 +117,49 @@ class LF():
         for i in tqdm(range(steps_outer, disable=self.disable_tqdm)):
             for j in range(steps_inner):
                 self.meta_model.copy(self.model, same_var=True)
+                datadict = self.loader.sample(num_train=self.meta_size, num_test=self.meta_val, )
+                train_data = (datadict['feat'], datadict['im'], datadict['gt'])
+                task_loss = self.inner_loop(train_data, self.lr_inner)
+                test_data = (datadict['featval'], datadict['imval'], datadict['gtval'])
+
+            new_task_loss = forward_and_backward(self.meta_model, test_data, train_data=train_data)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        torch.save(self.model.state_dict(), 'save/meta_model.pth.tar')
+
+
+    def test(self, ):
+        model = self.model.clone()
+        datadict = self.loader.sample(num_train=self.meta_size, num_test=self.meta_val, sample_test=True)
+        test_data = (datadict['testfeat'], datadict['testim'], datadict['testgt'])
+        total_len = test_data[0].size(0)
+        batch_size = 32
+        losses = AverageMeter()
+        auc = AverageMeter()
+        aae = AverageMeter()
+        for i in range(total_len//32):
+            im = test_data[0][i*batch_size:(i+1)*batch_size].to(self.device)
+            gt = test_data[2][i*batch_size:(i+1)*batch_size].to(self.device)
+            feat = test_data[1][i*batch_size:(i+1)*batch_size].to(self.device)
+            out = model(feat, im)
+            loss = self.criterion(out, gt)
+            outim = out.cpu().data.numpy().squeeze()
+            targetim = gt.cpu().data.numpy().squeeze()
+            aae1, auc1, _ = computeAAEAUC(outim,targetim)
+            auc.update(auc1)
+            aae.update(aae1)
+            losses.update(loss.item())
+
+        print(losses.avg, 'auc: ', auc.avg, 'aae:', aae.avg)
+        return losses.avg, auc.avg, aae.avg
+
+
+    def inner_loop(self, train_data, lr_inner=0.01):
+        loss = forward_and_backward(self.meta_model, train_data, create_graph=True)
+        for name, param in self.meta_model.named_params():
+            self.meta_model.set_param(name, param - lr_inner * param.grad)
+        return loss
                 
     # def trainLate(self):
     #     losses = AverageMeter()
