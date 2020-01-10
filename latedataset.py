@@ -43,41 +43,39 @@ class lateDataset(Dataset):
         return {'im': im, 'gt': gt, 'feat': feat}
 
 class lateDataset_meta(object):
-    def __init__(self, imgPath_s, gtPath, featPath, listFiles, listGtFiles, listFeat):
+    def __init__(self, imgPath_s, gtPath, featPath, listFiles, listFeat, test_batchsize=32):
         self.imgPath_s = imgPath_s
         self.gtPath = gtPath
         self.featPath = featPath
         self.listFeat = listFeat
         self.listFiles = listFiles
+        self.test_batchsize = test_batchsize
+        self.test_count = 0
 
-        self.all_ims = []
-        for n in listFiles:
-            valim = pil_loader_g(os.path.join(self.imgPath_s, n))
-            valim = torch.from_numpy(np.array(valim)).squeeze()
-            valim = valim.float().div(255.)
-            val_ims.append(valim)
-        self.all_ims = torch.stack(val_ims, 0).unsqueeze(1)
-        self.all_feats = []
-        for n in listFeats:
-            valim = pil_loader_g(os.path.join(self.imgPath_s, n))
-            valim = torch.from_numpy(np.array(valim)).squeeze()
-            valim = valim.float().div(255.)
-            val_feats.append(valim)
-        self.all_feats = torch.stack(val_feats, 0).unsqueeze(1)
-        start = int(listFiles[0][-9:-4])
-        end = int(listFiles[-1][-9:-4])
-        gt_start = int(listGtFiles[0][-9:-4])
-        gt_end = int(listGtFiles[-1][-9:-4])
-        self.listGtFiles = self.listGtFiles[(start-gt_start):(end-gt_end)]
-        self.all_gts = []
-        for n in self.listGtFiles:
-            valim = pil_loader_g(os.path.join(gtPath, n))
-            valim = torch.from_numpy(np.array(valim)).squeeze()
-            valim = valim.float().div(255.)
-            val_ims.append(valim)
-        self.all_gts = torch.stack(val_ims, 0).unsqueeze(1)
+        # self.all_ims = []
+        # for n in listFiles:
+        #     valim = pil_loader_g(os.path.join(self.imgPath_s, n))
+        #     valim = torch.from_numpy(np.array(valim)).squeeze()
+        #     valim = valim.float().div(255.)
+        #     val_ims.append(valim)
+        # self.all_ims = torch.stack(val_ims, 0).unsqueeze(1)
+        # self.all_feats = []
+        # for n in listFeats:
+        #     valim = pil_loader_g(os.path.join(self.imgPath_s, n))
+        #     valim = torch.from_numpy(np.array(valim)).squeeze()
+        #     valim = valim.float().div(255.)
+        #     val_feats.append(valim)
+        # self.all_feats = torch.stack(val_feats, 0).unsqueeze(1)
+        
+        # self.all_gts = []
+        # for n in self.listGtFiles:
+        #     valim = pil_loader_g(os.path.join(gtPath, n))
+        #     valim = torch.from_numpy(np.array(valim)).squeeze()
+        #     valim = valim.float().div(255.)
+        #     val_ims.append(valim)
+        # self.all_gts = torch.stack(val_ims, 0).unsqueeze(1)
         # (len, 1, 224, 224)
-        self.all_indices = list(range(self.all_feats.size(0)))
+        self.all_indices = list(range(len(self.listFeat)))
 
 
     def __len__(self):
@@ -85,26 +83,97 @@ class lateDataset_meta(object):
 
     def sample(self, num_train=4, num_test=100, sample_test=False):
         if not sample_test:
+            self.test_count = 0
             self.indices = random.sample(self.all_indices, num_train+num_test)  # sampled indices for meta learning
         train_indices = self.indices[:num_train]
         test_indices = self.indices[-num_test:]
         self.remaining_indices = [k for k in self.all_indices if k not in self.indices]  # for testing
-        im = torch.stack([self.all_ims[i] for i in train_indices], 0)
-        feat = torch.stack([self.all_feats[i] for i in train_indices], 0)
-        gt = torch.stack([self.all_gts[i] for i in train_indices], 0)
+        ims = []
+        feats = []
+        gts = []
+        for i in train_indices:
+            im = pil_loader_g(os.path.join(self.imgPath_s, self.listFiles[i]))
+            im = torch.from_numpy(np.array(im)).squeeze()
+            im = im.float().div(255.)
+            ims.append(im)
 
-        valim = torch.stack([self.all_ims[i] for i in test_indices], 0)
-        valfeat = torch.stack([self.all_feats[i] for i in test_indices], 0)
-        valgt = torch.stack([self.all_gts[i] for i in test_indices], 0)
+            im = pil_loader_g(os.path.join(self.featPath, self.listFeat[i]))
+            im = torch.from_numpy(np.array(im)).squeeze()
+            im = im.float().div(255.)
+            feats.append(im)
+
+            gtname = self.listFiles[i].split('_')
+            gtname = gtname[:2] + ['gt'] + gtname[2:]
+            gtname = '_'.join(gtname)
+            im = pil_loader_g(os.path.join(self.gtPath, gtname))
+            im = torch.from_numpy(np.array(im)).squeeze()
+            im = im.float().div(255.)
+            gts.append(im)
+
+        ims = torch.stack(ims, 0)
+        feats = torch.stack(feats, 0)
+        gts = torch.stack(gts, 0)
+
+        val_ims = []
+        val_feats = []
+        val_gts = []
+        for i in test_indices:
+            im = pil_loader_g(os.path.join(self.imgPath_s, self.listFiles[i]))
+            im = torch.from_numpy(np.array(im)).squeeze()
+            im = im.float().div(255.)
+            val_ims.append(im)
+
+            im = pil_loader_g(os.path.join(self.featPath, self.listFeat[i]))
+            im = torch.from_numpy(np.array(im)).squeeze()
+            im = im.float().div(255.)
+            val_feats.append(im)
+
+            gtname = self.listFiles[i].split('_')
+            gtname = gtname[:2] + ['gt'] + gtname[2:]
+            gtname = '_'.join(gtname)
+            im = pil_loader_g(os.path.join(self.gtPath, gtname))
+            im = torch.from_numpy(np.array(im)).squeeze()
+            im = im.float().div(255.)
+            val_gts.append(im)
+
+        val_ims = torch.stack(ims, 0)
+        val_feats = torch.stack(feats, 0)
+        val_gts = torch.stack(gts, 0)
 
         if sample_test:
-            testim = torch.stack([self.all_ims[i] for i in self.remaining_indices], 0)
-            testfeat = torch.stack([self.all_feats[i] for i in self.remaining_indices], 0)
-            testgt = torch.stack([self.all_gts[i] for i in self.remaining_indices], 0)
+            if (self.test_count+1)*self.test_batchsize >= len(self.remaining_indices):
+                return {'im': ims, 'gt': gts, 'feat': feats, 'valim': val_ims, 'valfeat': val_feats, 'valgt': valgts, \
+                'testim': None, 'testfeat': None, 'testgt': None}
+            indices = self.remaining_indices[self.test_count*self.test_batchsize:(self.test_count+1)*self.test_batchsize]
+            self.test_count += 1
+            testim = []
+            testfeat = []
+            testgt = []
+            for i in indices:
+                im = pil_loader_g(os.path.join(self.imgPath_s, self.listFiles[i]))
+                im = torch.from_numpy(np.array(im)).squeeze()
+                im = im.float().div(255.)
+                testim.append(im)
+
+                im = pil_loader_g(os.path.join(self.featPath, self.listFeat[i]))
+                im = torch.from_numpy(np.array(im)).squeeze()
+                im = im.float().div(255.)
+                testfeat.append(im)
+
+                gtname = self.listFiles[i].split('_')
+                gtname = gtname[:2] + ['gt'] + gtname[2:]
+                gtname = '_'.join(gtname)
+                im = pil_loader_g(os.path.join(self.gtPath, gtname))
+                im = torch.from_numpy(np.array(im)).squeeze()
+                im = im.float().div(255.)
+                testgt.append(im)
+            testim = torch.stack(testim, 0)
+            testfeat = torch.stack(testfeat, 0)
+            testgt = torch.stack(testgt, 0)
         else:
             testim, testfeat, testgt = torch.FloatTensor([0]), torch.FloatTensor([0]), torch.FloatTensor([0])
 
-        return {'im': im, 'gt': gt, 'feat': feat, 'valim': val_ims, 'valfeat': val_feats, 'valgt': valgt \
+        return {'im': ims, 'gt': gts, 'feat': feats, 'valim': val_ims, 'valfeat': val_feats, 'valgt': valgts, \
                 'testim': testim, 'testfeat': testfeat, 'testgt': testgt}
 
 
