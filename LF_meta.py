@@ -11,7 +11,7 @@ from random import randint
 from floss import floss
 from utils import *
 from models.late_fusion import late_fusion_meta as late_fusion
-from data.lateDataset import lateDataset
+from data.lateDataset import lateDataset_meta as lateDataset
 
 class LF():
     def __init__(self, pretrained_model, save_path = 'save', late_save_img = 'loss_late_meta.png',\
@@ -42,8 +42,10 @@ class LF():
         self.lr_outer = lr_outer
         self.steps_inner = steps_inner
         self.steps_outer = steps_outer
-        # listGtFiles = [k for k in os.listdir(gtPath) if val_name not in k]
-        # listGtFiles.sort()
+        self.meta_size = meta_size
+        self.meta_val = meta_val
+        listGtFiles = [k for k in os.listdir(gtPath) if val_name in k]
+        listGtFiles.sort()
         # listValGtFiles = [k for k in os.listdir(gtPath) if val_name in k]
         # if task is not None:
         #     listGtFiles = [k for k in listGtFiles if task in k]
@@ -54,34 +56,25 @@ class LF():
         imgPath_s = late_pred_path
         print('Loading SP predictions from /%s'%imgPath_s)
         listFiles = [k for k in os.listdir(imgPath_s) if val_name in k]
-        randstart = randint(0, len(listTrainFiles)- meta_size - meta_val)
-        listTrainFiles = listFiles[randstart:randstart+meta_size]
-        listValFiles = listFiles[randstart+meta_size: randstart+meta_size+meta_val]
-        listTestFiles = listFiles[:randstart] + listFiles[randstart+meta_size+meta_val:]
-        if task is not None:
-            x=input('not implemented yet...')
-            listTrainFiles = [k for k in listTrainFiles if task in k]
-            listValFiles = [k for k in listValFiles if task in k]
-        listTrainFiles.sort()
-        listValFiles.sort()
-        listTestFiles.sort()
-        print('num of LF val samples: ', len(listValFiles))
+        # all_inds = list(range(len(listFiles)))
+        # meta_training_inds = random.sample(all_inds, meta_size)
+        # all_inds = [k for k in all_inds if k not in meta_training_inds]
+        # meta_validation_inds = random.sample(all_inds, meta_val)
+        # all_inds = [k for k in all_inds if k not in meta_validation_inds]
+        listFiles.sort()
+        # listTrainFiles = [listFiles[k] for k in meta_training_inds]
+        # listValFiles = [listFiles[k] for k in meta_validation_inds]
+        # listTestFiles = [listFiles[k] for k in all_inds]
+        print('num of LF samples: ', len(listFiles))
 
         featPath = late_feat_path
         listFeats = [k for k in os.listdir(featPath) if val_name in k]
-        listTrainFeats = listFeats[randstart:randstart+meta_size]
-        listValFeats = listFeats[randstart+meta_size: randstart+meta_size+meta_val]
-        listTestFeats = listFeats[:randstart] + listFiles[randstart+meta_size+meta_val:]
-        # if task is not None:
-        #     listTrainFeats = [k for k in listTrainFeats if task in k]
-        #     listValFeats = [k for k in listValFeats if task in k]
-        listTrainFeats.sort()
-        listValFeats.sort()
-        listTestFeats.sort()
-        # assert(len(listTrainFeats) == len(listTrainFiles) and len(listGtFiles) > 0)
-        # assert(len(listValGtFiles) == len(listValFiles))
-        self.loader = DataLoader(dataset=lateDataset(imgPath_s, gtPath, featPath, listFiles, listGtFiles, listFeats, \
-            listValFiles, listValFeats), batch_size = batch_size, shuffle=True, num_workers=0, pin_memory=True)
+        listFeats.sort()
+        # listTrainFeats = [listFeats[k] for k in meta_training_inds]
+        # listValFeats = [listFeats[k] for k in meta_validation_inds]
+        # listTestFeats = [listFeats[k] for k in all_inds]
+
+        self.loader = lateDataset(imgPath_s, gtPath, featPath, listFiles, listFeats,)
         if loss_function == 'f':
             self.criterion = floss().to(self.device)
         else:
@@ -110,12 +103,16 @@ class LF():
             return loss.data.cpu()
 
     def train(self):
+        print('begin meta training')
+        steps_outer = self.steps_outer
+        steps_inner = self.steps_inner
 
         optimizer = torch.optim.Adam(self.model.params(), lr=self.lr_outer)
         valid_model = self.model.clone()
         valid_optim = torch.optim.SGD(valid_model.params(), lr = self.lr_inner)
-        for i in tqdm(range(steps_outer, disable=self.disable_tqdm)):
+        for i in tqdm(range(steps_outer), disable=self.disable_tqdm):
             for j in range(steps_inner):
+                print(j)
                 self.meta_model.copy(self.model, same_var=True)
                 datadict = self.loader.sample(num_train=self.meta_size, num_test=self.meta_val, )
                 train_data = (datadict['feat'], datadict['im'], datadict['gt'])
@@ -126,30 +123,37 @@ class LF():
             optimizer.step()
             optimizer.zero_grad()
 
+            valid_model.cpoy(self.model)
+            train_loss = forward_and_backward(valid_model, test_data, valid_optim)
+
         torch.save(self.model.state_dict(), 'save/meta_model.pth.tar')
+        print('training done')
 
 
     def test(self, ):
+        print('begin test')
         model = self.model.clone()
-        datadict = self.loader.sample(num_train=self.meta_size, num_test=self.meta_val, sample_test=True)
-        test_data = (datadict['testfeat'], datadict['testim'], datadict['testgt'])
-        total_len = test_data[0].size(0)
-        batch_size = 32
         losses = AverageMeter()
         auc = AverageMeter()
         aae = AverageMeter()
-        for i in range(total_len//32):
-            im = test_data[0][i*batch_size:(i+1)*batch_size].to(self.device)
-            gt = test_data[2][i*batch_size:(i+1)*batch_size].to(self.device)
-            feat = test_data[1][i*batch_size:(i+1)*batch_size].to(self.device)
-            out = model(feat, im)
-            loss = self.criterion(out, gt)
-            outim = out.cpu().data.numpy().squeeze()
-            targetim = gt.cpu().data.numpy().squeeze()
-            aae1, auc1, _ = computeAAEAUC(outim,targetim)
-            auc.update(auc1)
-            aae.update(aae1)
-            losses.update(loss.item())
+        while True:
+            datadict = self.loader.sample(num_train=self.meta_size, num_test=self.meta_val, sample_test=True)
+            test_data = (datadict['testfeat'], datadict['testim'], datadict['testgt'])
+            if test_data[0] is None:
+                break
+            
+            with torch.no_grad():
+                im = test_data[0].to(self.device)
+                gt = test_data[2].to(self.device)
+                feat = test_data[1].to(self.device)
+                out = model(feat, im)
+                loss = self.criterion(out, gt)
+                outim = out.cpu().data.numpy().squeeze()
+                targetim = gt.cpu().data.numpy().squeeze()
+                aae1, auc1, _ = computeAAEAUC(outim,targetim)
+                auc.update(auc1)
+                aae.update(aae1)
+                losses.update(loss.item())
 
         print(losses.avg, 'auc: ', auc.avg, 'aae:', aae.avg)
         return losses.avg, auc.avg, aae.avg
@@ -161,86 +165,45 @@ class LF():
             self.meta_model.set_param(name, param - lr_inner * param.grad)
         return loss
                 
-    # def trainLate(self):
-    #     losses = AverageMeter()
-    #     auc = AverageMeter()
-    #     aae = AverageMeter()
-    #     for i,sample in tqdm(enumerate(self.train_loader)):
-    #         im = sample['im']
-    #         gt = sample['gt']
-    #         feat = sample['feat']
-    #         im = im.float().to(self.device)
-    #         gt = gt.float().to(self.device)
-    #         feat = feat.float().to(self.device)
-    #         out = self.model(feat, im)
-    #         loss = self.criterion(out, gt)
-    #         outim = out.cpu().data.numpy().squeeze()
-    #         targetim = gt.cpu().data.numpy().squeeze()
-    #         aae1, auc1, _ = computeAAEAUC(outim,targetim)
-    #         auc.update(auc1)
-    #         aae.update(aae1)
-    #         losses.update(loss.item())
-    #         self.optimizer.zero_grad()
-    #         loss.backward()
-    #         self.optimizer.step()
-    #         if (i+1)%3000 == 0:
-    #             print('Epoch: [{0}][{1}/{2}]\t''AUCAAE_late {auc.avg:.3f} ({aae.avg:.3f})\t''Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
-    #                 self.epochnow, i+1, len(self.train_loader)+1, auc = auc, loss= losses, aae=aae,))
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--lr_outer', type=float, default=1e-3, required=False, help='lr for LF Adam')
+    parser.add_argument('--late_save_img', default='loss_late.png', required=False, help='name of train/val image of LF module')
+    parser.add_argument('--pretrained_late', default='../save/late.pth.tar', required=False, help='pretrained LF module')
+    parser.add_argument('--lstm_save_img', default='loss_lstm.png', required=False, help='name of train/val loss image of AT module')
+    parser.add_argument('--save_late', default='best_late_small.pth.tar', required=False, help='name of saving trained LF module')
+    parser.add_argument('--save_path', default='save', required=False)
+    parser.add_argument('--gtPath', default='../gtea_gts', required=False, help='directory of all groundtruth gaze maps in grey image format')
+    parser.add_argument('--loss_function', default='f', required=False, help= 'if is not set as f, use bce loss')
+    parser.add_argument('--num_epoch', type=int, default=10, required=False, help='num of training epoch of LF and SP')
+    parser.add_argument('--train_late', action='store_true', help='whether to train LF module')
+    parser.add_argument('--extract_late', action='store_true', help='whether to extract training data for LF module')
+    parser.add_argument('--extract_late_pred_folder', default='../gtea2_pred/', required=False, help='directory to store the training data for LF')
+    parser.add_argument('--extract_late_feat_folder', default='../gtea2_feat/', required=False, help='directory to store the training data for LF')
+    parser.add_argument('--device', default='0', help='now only support single GPU')
+    parser.add_argument('--val_name', default='Alireza', required=False, help='cross subject validation')
+    parser.add_argument('--task', default=None, required=False, help='cross task validation')
+    parser.add_argument('--fixsacPath', default='fixsac', required=False, help='directory of fixation prediction txt files')
+    parser.add_argument('--batch_size', type=int, default=64, help='batch size of LF')
+    parser.add_argument('--meta_size', type=int, default=10, help='meta training size')
+    parser.add_argument('--meta_val', type=int, default=100, help='meta validation size')
+    parser.add_argument('--steps_outer', type=int, default=5)
+    parser.add_argument('--steps_inner', type=int, default=10)
+    parser.add_argument('--lr_inner', type=int, default=1e-5)
+    parser.add_argument('--disable_tqdm', type=bool, default=False)
+    args = parser.parse_args()
 
-    #     return losses.avg, auc.avg, aae.avg
+    device = torch.device('cuda:'+args.device)
 
-    # def testLate(self):
-    #     losses = AverageMeter()
-    #     auc = AverageMeter()
-    #     aae = AverageMeter()
-    #     with torch.no_grad():
-    #         for i,sample in tqdm(enumerate(self.val_loader)):
-    #             im = sample['im']
-    #             gt = sample['gt']
-    #             feat = sample['feat']
-    #             im = im.float().to(self.device)
-    #             gt = gt.float().to(self.device)
-    #             feat = feat.float().to(self.device)
-    #             out = self.model(feat, im)
-    #             loss = self.criterion(out, gt)
-    #             outim = out.cpu().data.numpy().squeeze()
-    #             targetim = gt.cpu().data.numpy().squeeze()
-    #             aae1, auc1, _ = computeAAEAUC(outim,targetim)
-    #             auc.update(auc1)
-    #             aae.update(aae1)
-    #             losses.update(loss.item())
-    #             if (i+1) % 1000 == 0:
-    #                 print('Epoch: [{0}][{1}/{2}]\t''AUCAAE_late {auc.avg:.3f} ({aae.avg:.3f})\t''Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
-    #                     self.epochnow, i+1, len(self.val_loader)+1, auc = auc, loss= losses, aae=aae,))
+    batch_size = args.batch_size
+    lf = LF(pretrained_model = args.pretrained_late, save_path = args.save_path, late_save_img = args.late_save_img,\
+            save_name = args.save_late, device = args.device, late_pred_path = args.extract_late_pred_folder, num_epoch = args.num_epoch,\
+            late_feat_path = args.extract_late_feat_folder, gt_path = args.gtPath, val_name = args.val_name, batch_size = args.batch_size,\
+            loss_function = args.loss_function, lr_outer=args.lr_outer, task = args.task, meta_size=args.meta_size, \
+            meta_val=args.meta_val, steps_outer=args.steps_outer, steps_inner=args.steps_inner,\
+            lr_inner=args.lr_inner, disable_tqdm=args.disable_tqdm)
 
-    #     return losses.avg, auc.avg, aae.avg
-
-    # def train(self):
-    #     print('begin training LF module...')
-    #     trainprev = 999
-    #     valprev = 999
-    #     loss_train = []
-    #     loss_val = []
-    #     for epoch in range(self.num_epoch):
-    #         self.epochnow = epoch
-    #         loss, auc, aae = self.trainLate()
-    #         loss_train.append(loss)
-    #         print('training, auc is %5f, aae is %5f'%(auc, aae))
-    #         if loss < trainprev:
-    #             torch.save({'state_dict': self.model.state_dict(), 'loss': loss, 'auc': auc, 'aae': aae}, os.path.join(self.save_path, self.save_name))
-    #             trainprev = loss
-
-    #         loss, auc, aae = self.testLate()
-    #         loss_val.append(loss)
-    #         plot_loss(loss_train, loss_val, os.path.join(self.save_path, self.late_save_img))
-    #         if loss < valprev:
-    #             torch.save({'state_dict': self.model.state_dict(), 'loss': loss, 'auc': auc, 'aae': aae}, os.path.join(self.save_path, 'val'+self.save_name))
-    #             valprev = loss
-    #         print('testing, auc is %5f, aae is %5f' % (auc, aae))
-    #     print('LF module training finished!')
-
-    # def val(self):
-    #     print('begin testing LF module...')
-    #     loss, auc, aae = self.testLate()
-    #     print('AUC is : %04f, AAE is: %04f'%(auc, aae))
-    #     print('LF module testing finished!')
+    for i in range(1000):
+        lf.train()
+        lf.test()
