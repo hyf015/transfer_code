@@ -7,203 +7,566 @@ import math
 from tqdm import tqdm
 import os
 from random import randint
+from torchvision.transforms import ToTensor
 
 from floss import floss
 from utils import *
 from models.late_fusion import late_fusion_meta as late_fusion
 from data.lateDataset import lateDataset_meta as lateDataset
+from collections import defaultdict
 
-class LF():
-    def __init__(self, pretrained_model, save_path = 'save', late_save_img = 'loss_late_meta.png',\
-            save_name = 'best_late.pth.tar', device = '0', late_pred_path = '../gtea2_pred', num_epoch = 10,\
-            late_feat_path = '../gtea2_feat', gt_path = '../gtea_gts', val_name = 'Alireza', batch_size = 32,\
-            loss_function = 'f', lr_outer=1e-3, task = None, meta_size=5, meta_val=100, steps_outer=1, steps_inner=1,\
-            lr_inner=1e-2, disable_tqdm=False):
-        self.model = late_fusion()
-        self.meta_model = self.model.clone()
-        self.device = torch.device('cuda:'+device)
-        self.save_name = save_name
-        self.save_path = save_path
-        pretrained_dict = torch.load(pretrained_model, map_location='cpu')
-        pretrained_dict = pretrained_dict['state_dict']
-        model_dict = self.model.state_dict()
-        model_dict.update(pretrained_dict)
-        self.model.load_state_dict(model_dict)
-        print('loaded pretrained late fusion model from '+ pretrained_model)
-        self.model.to(self.device)
-        self.batch_size = batch_size
-        self.num_epoch = num_epoch
-        self.epochnow = 0
-        self.late_save_img = late_save_img
-        gtPath = gt_path
+valid_tasks = ['American', 'Pizza', 'Burger', 'Snack', 'Greek', 'Pasta', 'Turkey']
+valid_names = ['Alireza', 'Carlos', 'Rahul',]
+valid_names_train = ['Carlos', 'Rahul',]
+valid_names_test = ['Alireza']
+names_for_overall = ['Shaghayegh', 'Yin']
 
-        self.disable_tqdm = disable_tqdm
-        self.lr_inner = lr_inner
-        self.lr_outer = lr_outer
-        self.steps_inner = steps_inner
-        self.steps_outer = steps_outer
-        self.meta_size = meta_size
-        self.meta_val = meta_val
-        listGtFiles = [k for k in os.listdir(gtPath) if val_name in k]
-        listGtFiles.sort()
-        # listValGtFiles = [k for k in os.listdir(gtPath) if val_name in k]
-        # if task is not None:
-        #     listGtFiles = [k for k in listGtFiles if task in k]
-        #     listValGtFiles = [k for k in listValGtFiles if task in k]
-        # listValGtFiles.sort()
-        # print('num of training LF samples: %d'%len(listGtFiles))
+def is_valid(k, valid_names=valid_names):
+    for n in valid_names:
+        if n in k:
+            return True
+    return False
 
-        imgPath_s = late_pred_path
-        print('Loading SP predictions from /%s'%imgPath_s)
-        listFiles = [k for k in os.listdir(imgPath_s) if val_name in k]
-        # all_inds = list(range(len(listFiles)))
-        # meta_training_inds = random.sample(all_inds, meta_size)
-        # all_inds = [k for k in all_inds if k not in meta_training_inds]
-        # meta_validation_inds = random.sample(all_inds, meta_val)
-        # all_inds = [k for k in all_inds if k not in meta_validation_inds]
-        listFiles.sort()
-        # listTrainFiles = [listFiles[k] for k in meta_training_inds]
-        # listValFiles = [listFiles[k] for k in meta_validation_inds]
-        # listTestFiles = [listFiles[k] for k in all_inds]
-        print('num of LF samples: ', len(listFiles))
+def pil_loader_g(path):
+    with open(path, 'rb') as f:
+        with Image.open(f) as img:
+            return img.convert('L')
 
-        featPath = late_feat_path
-        listFeats = [k for k in os.listdir(featPath) if val_name in k]
-        listFeats.sort()
-        # listTrainFeats = [listFeats[k] for k in meta_training_inds]
-        # listValFeats = [listFeats[k] for k in meta_validation_inds]
-        # listTestFeats = [listFeats[k] for k in all_inds]
+class Tasks(object):
+    def __init__(self, feat_path, pred_path, gt_path, valid_names=valid_names):
 
-        self.loader = lateDataset(imgPath_s, gtPath, featPath, listFiles, listFeats,)
-        if loss_function == 'f':
-            self.criterion = floss().to(self.device)
+        self.num_tasks = len(valid_names)
+        self.valid_names = valid_names
+        self.feat_path = feat_path
+        self.pred_path = pred_path
+        self.gt_path = gt_path
+        feats = os.listdir(feat_path)
+        feats = {}
+        for n in valid_names:
+            feats[n] = sorted([k for k in os.listdir(feat_path) if n in k])
+
+        # Now load in all data into memory for selected tasks
+        self.ims = defaultdict(list)
+        self.preds = defaultdict(list)
+        self.gts = defaultdict(list)
+        for n in valid_names:
+            for m in feats[n]:
+                im = pil_loader_g(os.path.join(feat_path, m))
+                im = ToTensor(im)
+                self.ims[n].append(im)
+
+                im = pil_loader_g(os.path.join(pred_path, m))
+                im = ToTensor(im)
+                self.preds[n].append(im)
+
+                imname = m.split('_')
+                imname = imname[:2] + 'gt' + imname[2:]
+                imname = '_'.join(imname)
+                im = pil_loader_g(os.path.join(gt_path, imname))
+                self.gts[n].append(im)
+
+
+        # By default, we just sample disjoint sets from the entire given data
+        self.all_indices = {k:list(range(len(v)))
+                            for k,v in self.ims.items()}
+        self.train_indices = self.all_indices
+        self.test_indices = self.all_indices
+
+    def create_sample(self, task, indices, device):
+        """Create a sample of a task for meta-learning.
+        This consists of a x, y pair.
+        """
+        feat = [self.ims[task][i] for i in indices]
+        pred = [self.preds[task][i] for i in indices]
+        gt = [self.gts[task][i] for i in indices]
+        
+        return {'im': torch.stack(feat, 0).to(device), 'pred': torch.stack(pred,0).to(device), 
+        'gt': torch.stack(gt, 0).to(device)}
+
+    def sample(self, num_train=4, num_test=100, device=torch.device('cuda:0')):
+        """Yields training and testing samples."""
+        picked_task = random.randint(0, self.num_tasks - 1)
+        return self.sample_for_task(self.valid_names[picked_task], num_train=num_train,
+                                    num_test=num_test, device=device)
+
+    def sample_for_task(self, task, num_train=4, num_test=100, device=device):
+        if self.train_indices[task] is self.test_indices[task]:
+            # This is for meta-training and meta-validation
+            indices = random.sample(self.all_indices[task], num_train + num_test)
+            train_indices = indices[:num_train]
+            test_indices = indices[-num_test:]
         else:
-            self.criterion = torch.nn.BCELoss().to(self.device)
+            # This is for meta-testing
+            train_indices = random.sample(self.train_indices[task], num_train)
+            test_indices = self.test_indices[task]
+        return (self.create_sample(task, train_indices),
+                self.create_sample(task, test_indices))
 
-    def forward_and_backward(self, data, optimizer=None, create_graph=False, train_data=None):
-        self.model.train()
-        if optimizer is not None:
-            optimizer.zero_grad()
-        loss = self.forward(data, train_data=train_data, for_backward=True)
-        if optimizer is not None:
-            optimizer.step()
+
+class TestTasks(Tasks):
+    """Class for final testing (not testing within meta-learning."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_indices = [indices[:-500] for indices in self.all_indices]
+        self.test_indices = [indices[-500:] for indices in self.all_indices]
+
+
+"""
+    Replacement classes for standard PyTorch Module and Linear.
+"""
+
+
+class ModifiableModule(nn.Module):
+    def params(self):
+        return [p for _, p in self.named_params()]
+
+    def named_leaves(self):
+        return []
+
+    def named_submodules(self):
+        return []
+
+    def named_params(self):
+        subparams = []
+        for name, mod in self.named_submodules():
+            for subname, param in mod.named_params():
+                subparams.append((name + '.' + subname, param))
+        return self.named_leaves() + subparams
+
+    def set_param(self, name, param, copy=False):
+        if '.' in name:
+            n = name.split('.')
+            module_name = n[0]
+            rest = '.'.join(n[1:])
+            for name, mod in self.named_submodules():
+                if module_name == name:
+                    mod.set_param(rest, param, copy=copy)
+                    break
+        else:
+            if copy is True:
+                setattr(self, name, V(param.data.clone(), requires_grad=True))
+            else:
+                assert hasattr(self, name)
+                setattr(self, name, param)
+
+    def copy(self, other, same_var=False):
+        for name, param in other.named_params():
+            self.set_param(name, param, copy=not same_var)
+
+
+class GradConv(ModifiableModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        ignore = nn.Conv2d(*args, **kwargs)
+
+        nn.init.normal_(ignore.weight.data, mean=0.0, std=np.sqrt(1. / args[0]))
+        nn.init.constant_(ignore.bias.data, val=0)
+
+        self.weights = torch.tensor(ignore.weight.data, requires_grad=True)
+        self.bias = torch.tensor(ignore.bias.data, requires_grad=True)
+
+    def forward(self, x):
+        return F.conv2d(x, self.weights, self.bias)
+
+    def named_leaves(self):
+        return [('weights', self.weights), ('bias', self.bias)]
+
+class GradNorm(ModifiableModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        ignore = nn.BatchNorm2d(*args, **kwargs)
+
+        nn.init.constant_(ignore.weight.data, val=1.0)
+        nn.init.constant_(ignore.bias.data, val=0)
+
+        self.weights = torch.tensor(ignore.weight.data, requires_grad=True)
+        self.bias = torch.tensor(ignore.bias.data, requires_grad=True)
+        self.running_mean = nn.Parameter(torch.zeros(param[0]), requires_grad=False)
+        self.running_var = nn.Parameter(torch.ones(param[0]), requires_grad=False)
+
+    def forward(self, x):
+        return F.batch_norm(x, self.running_mean, self.running_var, weight=self.weights, bias=self.bias)
+
+    def named_leaves(self):
+        return [('weights', self.weights), ('bias', self.bias), ('running_mean', self.running_mean), 
+        'running_var', self.running_var]
+
+"""
+    Meta-learnable fully-connected neural network model definition
+"""
+
+
+class GazeEstimationModel(ModifiableModule):
+    def __init__(self, ):
+        super().__init__()
+
+        # Construct layers
+        self.layers = []
+        self.layers.append(('fusion.0',GradConv(2, 32, kernel_size=3, padding = 1)))
+        self.layers.append(('fusion.1', GradNorm(32)))
+        self.layers.append('relu', nn.ReLU())
+        self.layers.append(('fusion.3',GradConv(32, 32, kernel_size=3, padding = 1)))
+        self.layers.append(('fusion.4', GradNorm(32)))
+        self.layers.append('relu', nn.ReLU())
+
+        self.layers.append(('fusion.6',GradConv(32, 8, kernel_size=3, padding = 1)))
+        self.layers.append(('fusion.7', GradNorm(8)))
+        self.layers.append('relu', nn.ReLU())
+        self.layers.append(('fusion.9',GradConv(8, 1, kernel_size=1, padding = 0)))
+
+        # For use with Meta-SGD
+        # self.alphas = []
+        # if make_alpha:
+        #     for i, f_now in enumerate(self.layer_num_features[:-1]):
+        #         f_next = self.layer_num_features[i + 1]
+        #         alphas = GradLinear(f_now, f_next)
+        #         alphas.weights.data.uniform_(0.005, 0.1)
+        #         alphas.bias.data.uniform_(0.005, 0.1)
+        #         self.alphas.append(('alpha%02d' % (i + 1), alphas))
+
+    def clone(self,):
+        new_model = self.__class__(self.activation_type, self.layer_num_features,
+                                   make_alpha=make_alpha)
+        new_model.copy(self)
+        return new_model
+
+    def state_dict(self):
+        output = {}
+        for key, layer in self.layers:
+            output[key + '.weights'] = layer.weights.data
+            output[key + '.bias'] = layer.bias.data
+        return output
+
+    def load_state_dict(self, weights):
+        for key, tensor in weights.items():
+            self.set_param(key, tensor, copy=True)
+
+    def forward(self, x):
+        for name, layer in self.layers:
+            if name == 'relu':
+                x = F.relu_(x)
+            else:
+                x = layer(x)
+        x = torch.sigmoid(x)
+        return x
+
+    def named_submodules(self):
+        return self.layers
+
+
+"""
+    Meta-learning utility functions.
+"""
+
+
+def forward_and_backward(model, data, optim=None, create_graph=False,
+                         train_data=None, loss_function=floss().to(torch.device('cuda:0'))):
+    model.train()
+    if optim is not None:
+        optim.zero_grad()
+    loss = forward(model, data, train_data=train_data, for_backward=True,
+                   loss_function=loss_function)
+    loss.backward(create_graph=create_graph, retain_graph=(optim is None))
+    if optim is not None:
+        # nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optim.step()
+    return loss.data.cpu().numpy()
+
+
+def forward(model, data, return_predictions=False, train_data=None,
+            for_backward=False, loss_function=floss().to(torch.device('cuda:0'))):
+    model.train()
+    im, pred, gt = data['im'], data['pred'], data['gt']
+    y_hat = model(im, pred)
+    loss = loss_function(y_hat, gt)
+    if return_predictions:
+        return y_hat.data.cpu().numpy()
+    elif for_backward:
         return loss
+    else:
+        return loss.data.cpu().numpy()
 
-    def forward(self, data, return_predictions=False, train_data=None, for_backward=False):
-        self.model.train()
 
-        feat, im, gt = data
-        y_hat = self.model(feat, im)
-        loss = self.criterion(y_hat, gt)
-        if return_predictions:
-            return y_hat
-        elif for_backward:
-            return loss
-        else:
-            return loss.data.cpu()
+"""
+    Inference through model (with/without gradient calculation)
+"""
 
-    def train(self):
-        print('begin meta training')
-        steps_outer = self.steps_outer
-        steps_inner = self.steps_inner
 
-        optimizer = torch.optim.Adam(self.model.params(), lr=self.lr_outer)
-        valid_model = self.model.clone()
-        valid_optim = torch.optim.SGD(valid_model.params(), lr = self.lr_inner)
-        for i in tqdm(range(steps_outer), disable=self.disable_tqdm):
+class MAML(object):
+    def __init__(self, model, k, output_dir='save/',
+                 train_tasks=None, valid_tasks=None, device=torch.device('cuda:0')):
+        self.model = model.to(device)
+        self.meta_model = model.clone().to(device)
+
+        self.train_tasks = train_tasks
+        self.valid_tasks = valid_tasks
+        self.k = k
+        self.loss_function = floss().to(device)
+
+        self.output_dir = output_dir
+
+    @property
+    def model_parameters_path(self):
+        return '%s/meta_learned_parameters.pth.tar' % self.output_dir
+
+    def save_model_parameters(self):
+        if self.output_dir is not None:
+            torch.save(self.model.state_dict(), self.model_parameters_path)
+
+    def load_model_parameters(self):
+        if os.path.isfile(self.model_parameters_path):
+            weights = torch.load(self.model_parameters_path)
+            self.model.load_state_dict(weights)
+            print('> Loaded weights from %s' % self.model_parameters_path)
+
+    def train(self, steps_outer, steps_inner=1, lr_inner=0.01, lr_outer=0.001,
+              disable_tqdm=False):
+        self.lr_inner = lr_inner
+        print('\nBeginning meta-learning for k = %d' % self.k)
+
+        # Outer loop optimizer
+        optimizer = torch.optim.Adam(self.model.params(), lr=lr_outer)
+
+        # Model and optimizer for validation
+        valid_model = self.model.clone().to(device)
+        valid_optim = torch.optim.SGD(valid_model.params(), lr=self.lr_inner)
+
+        for i in tqdm(range(steps_outer), disable=disable_tqdm):
             for j in range(steps_inner):
-                print(j)
+                # Make copy of main model
                 self.meta_model.copy(self.model, same_var=True)
-                datadict = self.loader.sample(num_train=self.meta_size, num_test=self.meta_val, )
-                train_data = (datadict['feat'], datadict['im'], datadict['gt'])
-                task_loss = self.inner_loop(train_data, self.lr_inner)
-                test_data = (datadict['featval'], datadict['imval'], datadict['gtval'])
 
-            new_task_loss = forward_and_backward(self.meta_model, test_data, train_data=train_data)
+                # Get a task
+                train_data, test_data = self.train_tasks.sample(num_train=self.k, device=self.device)
+
+                # Run the rest of the inner loop
+                task_loss = self.inner_loop(train_data, self.lr_inner)
+
+            # Calculate gradients on a held-out set
+            new_task_loss = forward_and_backward(
+                self.meta_model, test_data, train_data=train_data, loss_function=self.loss_function
+            )
+
+            # Update the main model
             optimizer.step()
             optimizer.zero_grad()
 
-            valid_model.cpoy(self.model)
-            train_loss = forward_and_backward(valid_model, test_data, valid_optim)
+            if (i + 1) % 100 == 0:
+                # Validation
+                losses = []
+                for j in range(self.valid_tasks.num_tasks):
+                    valid_model.copy(self.model)
+                    train_data, test_data = self.valid_tasks.sample_for_task(j, num_train=self.k)
+                    train_loss = forward_and_backward(valid_model, train_data, valid_optim, loss_function=self.loss_function)
+                    valid_loss = forward(valid_model, test_data, train_data=train_data, loss_function=self.loss_function)
+                    losses.append((train_loss, valid_loss))
+                train_losses, valid_losses = zip(*losses)
+                print('%d, meta-valid/train-loss'%i, np.mean(train_losses))
+                print('%d, meta-valid/valid-loss'%i, np.mean(valid_losses))
 
-        torch.save(self.model.state_dict(), 'save/meta_model.pth.tar')
-        print('training done')
+        # Save MAML initial parameters
+        self.save_model_parameters()
 
+    def test(self, test_tasks_list, num_iterations=[1, 5, 10], num_repeats=20):
+        print('\nBeginning testing for meta-learned model with k = %d\n' % self.k)
+        model = self.model.clone().to(self.device)
 
-    def test(self, ):
-        print('begin test')
-        model = self.model.clone()
-        losses = AverageMeter()
-        auc = AverageMeter()
-        aae = AverageMeter()
-        while True:
-            datadict = self.loader.sample(num_train=self.meta_size, num_test=self.meta_val, sample_test=True)
-            test_data = (datadict['testfeat'], datadict['testim'], datadict['testgt'])
-            if test_data[0] is None:
-                break
-            
-            with torch.no_grad():
-                im = test_data[0].to(self.device)
-                gt = test_data[2].to(self.device)
-                feat = test_data[1].to(self.device)
-                out = model(feat, im)
-                loss = self.criterion(out, gt)
-                outim = out.cpu().data.numpy().squeeze()
-                targetim = gt.cpu().data.numpy().squeeze()
-                aae1, auc1, _ = computeAAEAUC(outim,targetim)
-                auc.update(auc1)
-                aae.update(aae1)
-                losses.update(loss.item())
+        # IMPORTANT
+        #
+        # Sets consistent seed such that as long as --num-test-repeats is the
+        # same, experiment results from multiple invocations of this script can
+        # yield the same calibration samples.
+        # random.seed(4089213955)
 
-        print(losses.avg, 'auc: ', auc.avg, 'aae:', aae.avg)
-        return losses.avg, auc.avg, aae.avg
+        for test_set_name, test_tasks in test_tasks_list.items():
+            predictions = OrderedDict()
+            losses = OrderedDict([(n, []) for n in num_iterations])
+            for i, task_name in enumerate(test_tasks.selected_tasks):
+                predictions[task_name] = []
+                for t in range(num_repeats):
+                    model.copy(self.model)
+                    optim = torch.optim.SGD(model.params(), lr=self.lr_inner)
 
+                    train_data, test_data = test_tasks.sample_for_task(i, num_train=self.k)
+                    if num_iterations[0] == 0:
+                        train_loss = forward(model, train_data, loss_function=self.loss_function)
+                        test_loss = forward(model, test_data, train_data=train_data, loss_function=self.loss_function)
+                        losses[0].append((train_loss, test_loss))
+                    for j in range(np.amax(num_iterations)):
+                        train_loss = forward_and_backward(model, train_data, optim, loss_function=self.loss_function)
+                        if (j + 1) in num_iterations:
+                            test_loss = forward(model, test_data, train_data=train_data, loss_function=self.loss_function)
+                            losses[j + 1].append((train_loss, test_loss))
+
+                    # Register ground truth and prediction
+                    predictions[task_name].append({
+                        'groundtruth': test_data[1].cpu().numpy(),
+                        'predictions': forward(model, test_data,
+                                               return_predictions=True,
+                                               train_data=train_data),
+                    })
+                    predictions[task_name][-1]['errors'] = angular_error(
+                        predictions[task_name][-1]['groundtruth'],
+                        predictions[task_name][-1]['predictions'],
+                    )
+
+                print('Done for k = %3d, %s/%s... train: %.3f, test: %.3f' % (
+                    self.k, test_set_name, task_name,
+                    np.mean([both[0] for both in losses[num_iterations[-1]][-num_repeats:]]),
+                    np.mean([both[1] for both in losses[num_iterations[-1]][-num_repeats:]]),
+                ))
+
+            if self.output_dir is not None:
+                # Save predictions to file
+                pkl_path = '%s/predictions_%s.pkl' % (self.output_dir, test_set_name)
+                with open(pkl_path, 'wb') as f:
+                    pickle.dump(predictions, f)
+
+                # Write loss values as plain text too
+                np.savetxt('%s/losses_%s_train.txt' % (self.output_dir, test_set_name),
+                           [[n, np.mean(list(zip(*v))[0])] for n, v in losses.items()])
+                np.savetxt('%s/losses_%s_valid.txt' % (self.output_dir, test_set_name),
+                           [[n, np.mean(list(zip(*v))[1])] for n, v in losses.items()])
+
+            out_msg = '> Completed test on %s for k = %d' % (test_set_name, self.k)
+            final_n = sorted(num_iterations)[-1]
+            final_train_losses, final_test_losses = zip(*(losses[final_n]))
+            out_msg += ('\n  at %d steps losses were... train: %.3f, test: %.3f +/- %.3f' %
+                        (final_n, np.mean(final_train_losses),
+                         np.mean(final_test_losses),
+                         np.mean([
+                             np.std([
+                                 data['errors'] for data in person_data
+                             ], axis=0)
+                             for person_data in predictions.values()
+                         ])))
+            print(out_msg)
 
     def inner_loop(self, train_data, lr_inner=0.01):
-        loss = forward_and_backward(self.meta_model, train_data, create_graph=True)
+        # Forward-pass and calculate gradients on meta model
+        loss = forward_and_backward(self.meta_model, train_data,
+                                    create_graph=True)
+
+        # Apply gradients
         for name, param in self.meta_model.named_params():
             self.meta_model.set_param(name, param - lr_inner * param.grad)
         return loss
-                
+
+
+
+"""
+    Actual run script
+"""
+
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--lr_outer', type=float, default=1e-3, required=False, help='lr for LF Adam')
-    parser.add_argument('--late_save_img', default='loss_late.png', required=False, help='name of train/val image of LF module')
-    parser.add_argument('--pretrained_late', default='../save/late.pth.tar', required=False, help='pretrained LF module')
-    parser.add_argument('--lstm_save_img', default='loss_lstm.png', required=False, help='name of train/val loss image of AT module')
-    parser.add_argument('--save_late', default='best_late_small.pth.tar', required=False, help='name of saving trained LF module')
-    parser.add_argument('--save_path', default='save', required=False)
-    parser.add_argument('--gtPath', default='../gtea_gts', required=False, help='directory of all groundtruth gaze maps in grey image format')
-    parser.add_argument('--loss_function', default='f', required=False, help= 'if is not set as f, use bce loss')
-    parser.add_argument('--num_epoch', type=int, default=10, required=False, help='num of training epoch of LF and SP')
-    parser.add_argument('--train_late', action='store_true', help='whether to train LF module')
-    parser.add_argument('--extract_late', action='store_true', help='whether to extract training data for LF module')
-    parser.add_argument('--extract_late_pred_folder', default='../gtea2_pred/', required=False, help='directory to store the training data for LF')
-    parser.add_argument('--extract_late_feat_folder', default='../gtea2_feat/', required=False, help='directory to store the training data for LF')
-    parser.add_argument('--device', default='0', help='now only support single GPU')
-    parser.add_argument('--val_name', default='Alireza', required=False, help='cross subject validation')
-    parser.add_argument('--task', default=None, required=False, help='cross task validation')
-    parser.add_argument('--fixsacPath', default='fixsac', required=False, help='directory of fixation prediction txt files')
-    parser.add_argument('--batch_size', type=int, default=64, help='batch size of LF')
-    parser.add_argument('--meta_size', type=int, default=10, help='meta training size')
-    parser.add_argument('--meta_val', type=int, default=100, help='meta validation size')
-    parser.add_argument('--steps_outer', type=int, default=5)
-    parser.add_argument('--steps_inner', type=int, default=10)
-    parser.add_argument('--lr_inner', type=int, default=1e-5)
-    parser.add_argument('--disable_tqdm', type=bool, default=False)
+
+    # Define and parse configuration for training and evaluations
+    parser = argparse.ArgumentParser(description='Meta-learn gaze estimator from RotAE embeddings.')
+    
+    parser.add_argument('--disable-tqdm', action='store_true',
+                        help='Disable progress bar from tqdm (in particular on NGC).')
+
+    parser.add_argument('--load_pretrained_base', action='store_true')
+
+
+    # Parameters for meta-learning
+    parser.add_argument('--gt_path', type=str, default='../gtea_gts')
+    parser.add_argument('--pred_path', type=str, default='../gtea2_preds')
+    parser.add_argument('--feat_path', type=str, default='../gtea2_feats')
+    parser.add_argument('--steps-meta-training', type=int, default=100000,
+                        help='Number of steps to meta-learn for (default: 100000)')
+    parser.add_argument('--tasks-per-meta-iteration', type=int, default=5,
+                        help='Tasks to evaluate per meta-learning iteration (default: 5)')
+    parser.add_argument('--lr-inner', type=float, default=1e-5,
+                        help='Learning rate for inner loop (for the task) (default: 1e-5)')
+    parser.add_argument('--lr-outer', type=float, default=1e-3,
+                        help='Learning rate for outer loop (the meta learner) (default: 1e-3)')
+
+    # Evaluation
+    parser.add_argument('--skip-training', action='store_true',
+                        help='Skips meta-training')
+    parser.add_argument('k', type=int,
+                        help='Number of calibration samples to use - k as in k-shot learning.')
+    parser.add_argument('--num-test-repeats', type=int, default=100,
+                        help='Number of times to repeat drawing of k samples for testing '
+                             + '(default: 100)')
+    parser.add_argument('--steps-testing', type=int, default=1000,
+                        help='Number of steps to meta-learn for (default: 1000)')
+
     args = parser.parse_args()
 
-    device = torch.device('cuda:'+args.device)
+    # Define data sources (tasks)
+    x_keys = 0
+    meta_train_tasks = Tasks(args.feat_path, args.pred_path, args.gt_path, valid_names_train)
+    meta_val_tasks = Tasks(args.feat_path, args.pred_path, args.gt_path, valid_names_test)
+    meta_test_tasks = [
+        ('gtea', TestTasks(args.feat_path, args.pred_path, args.gt_path, valid_names_test)),
+    ]
 
-    batch_size = args.batch_size
-    lf = LF(pretrained_model = args.pretrained_late, save_path = args.save_path, late_save_img = args.late_save_img,\
-            save_name = args.save_late, device = args.device, late_pred_path = args.extract_late_pred_folder, num_epoch = args.num_epoch,\
-            late_feat_path = args.extract_late_feat_folder, gt_path = args.gtPath, val_name = args.val_name, batch_size = args.batch_size,\
-            loss_function = args.loss_function, lr_outer=args.lr_outer, task = args.task, meta_size=args.meta_size, \
-            meta_val=args.meta_val, steps_outer=args.steps_outer, steps_inner=args.steps_inner,\
-            lr_inner=args.lr_inner, disable_tqdm=args.disable_tqdm)
+    # Construct output directory path string
+    output_dir = 'save/'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-    for i in range(1000):
-        lf.train()
-        lf.test()
+    # Get an example entry to design gaze estimation model
+    model = GazeEstimationModel()
+    meta_learner = MAML(model, args.k, output_dir,
+                                      meta_train_tasks, meta_val_tasks,
+                                      device=torch.device('cuda:0'))
+
+    # If doing fine-tuning... try to load pre-trained MLP weights
+    if args.load_pretrained_base:
+        pretrained_dict = torch.load('save/lf_base.pth.tar')['state_dict']
+        model_dict = model.state_dict()
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        print('loaded pretrained_dict from save/lf_base.pth.tar')
+    # if args.meta_learner == 'NONE' or args.maml_use_pretrained_mlp:
+    #     import glob
+    #     checkpoint_path = sorted(
+    #         glob.glob('%s/checkpoints/at_step_*.pth.tar' % args.input_dir)
+    #     )[-1]
+    #     weights = torch.load(checkpoint_path)
+    #     try:
+    #         state_dict = {
+    #             'layer01.weights': weights['module.gaze1.weight'],
+    #             'layer01.bias': weights['module.gaze1.bias'],
+    #             'layer02.weights': weights['module.gaze2.weight'],
+    #             'layer02.bias': weights['module.gaze2.bias'],
+    #         }
+    #         if args.select_z == 'before_z':
+    #             state_dict['layer00.weights'] = weights['module.fc_enc.weight']
+    #             state_dict['layer00.bias'] = weights['module.fc_enc.bias']
+    #     except:  # noqa
+    #         state_dict = {
+    #             'layer01.weights': weights['gaze1.weight'],
+    #             'layer01.bias': weights['gaze1.bias'],
+    #             'layer02.weights': weights['gaze2.weight'],
+    #             'layer02.bias': weights['gaze2.bias'],
+    #         }
+    #         if args.select_z == 'before_z':
+    #             state_dict['layer00.weights'] = weights['fc_enc.weight']
+    #             state_dict['layer00.bias'] = weights['fc_enc.bias']
+    #     for key, values in state_dict.items():
+    #         model.set_param(key, values, copy=True)
+    #     del state_dict
+    #     print('Loaded %s' % checkpoint_path)
+
+    if not args.skip_training:
+        meta_learner.train(
+            steps_outer=args.steps_meta_training,
+            steps_inner=args.tasks_per_meta_iteration,
+            lr_inner=args.lr_inner,
+            lr_outer=args.lr_outer,
+            disable_tqdm=args.disable_tqdm,
+        )
+
+    # Perform test (which entails the repeated training of person-specific models
+    if args.skip_training:
+        meta_learner.load_model_parameters()
+    meta_learner.lr_inner = args.lr_inner
+    meta_learner.test(
+        test_tasks_list=OrderedDict(meta_test_tasks),
+        num_iterations=list(np.arange(start=0, stop=args.steps_testing + 1, step=20)),
+        num_repeats=args.num_test_repeats,
+    )
